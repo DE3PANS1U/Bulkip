@@ -12,27 +12,49 @@ VT_URL = "https://www.virustotal.com/api/v3/ip_addresses/{}"
 _jobs = {}
 _jobs_lock = threading.Lock()
 
-# Per-key exhaustion tracker: { key -> {"exhausted": bool, "exhausted_at": datetime|None, "used": int} }
+# Per-key state: exhausted (daily quota), rate_limited (per-minute), used count
+# { key -> {"exhausted": bool, "exhausted_at": dt|None, "rate_limited_until": dt|None, "used": int} }
 _key_states = {}
 _key_states_lock = threading.Lock()
 
+RATE_LIMIT_COOLDOWN = 60  # seconds to cool down after a 429
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
 
 def _utc_today():
-    return datetime.now(timezone.utc).date()
+    return _utc_now().date()
 
 
 def init_key_states(keys):
     with _key_states_lock:
         for key in keys:
             if key not in _key_states:
-                _key_states[key] = {"exhausted": False, "exhausted_at": None, "used": 0}
+                _key_states[key] = {
+                    "exhausted": False,
+                    "exhausted_at": None,
+                    "rate_limited_until": None,
+                    "used": 0,
+                }
 
 
 def _mark_exhausted(key):
     with _key_states_lock:
         if key in _key_states:
             _key_states[key]["exhausted"] = True
-            _key_states[key]["exhausted_at"] = datetime.now(timezone.utc)
+            _key_states[key]["exhausted_at"] = _utc_now()
+
+
+def _mark_rate_limited(key):
+    with _key_states_lock:
+        if key in _key_states:
+            _key_states[key]["rate_limited_until"] = _utc_now().replace(
+                microsecond=0
+            ).__class__.fromtimestamp(
+                _utc_now().timestamp() + RATE_LIMIT_COOLDOWN, tz=timezone.utc
+            )
 
 
 def _increment_used(key):
@@ -41,34 +63,51 @@ def _increment_used(key):
             _key_states[key]["used"] += 1
 
 
-def _is_exhausted(key):
+def _is_unavailable(key):
+    """Returns True if key is exhausted (daily) or rate-limited (cooldown not expired)."""
     with _key_states_lock:
         state = _key_states.get(key)
-        if not state or not state["exhausted"]:
+        if not state:
             return False
-        # Auto-reset if the exhausted_at date is before today (VT resets at midnight UTC)
-        exhausted_date = state["exhausted_at"].date() if state["exhausted_at"] else None
-        if exhausted_date and exhausted_date < _utc_today():
-            state["exhausted"] = False
-            state["exhausted_at"] = None
-            state["used"] = 0
-            return False
-        return True
+        # Daily quota exhausted — auto-reset at UTC midnight
+        if state["exhausted"]:
+            exhausted_date = state["exhausted_at"].date() if state["exhausted_at"] else None
+            if exhausted_date and exhausted_date < _utc_today():
+                state["exhausted"] = False
+                state["exhausted_at"] = None
+                state["used"] = 0
+            else:
+                return True
+        # Per-minute rate limit cooldown
+        if state["rate_limited_until"] and _utc_now() < state["rate_limited_until"]:
+            return True
+        elif state["rate_limited_until"] and _utc_now() >= state["rate_limited_until"]:
+            state["rate_limited_until"] = None  # cooldown expired
+        return False
 
 
 def get_key_status():
     with _key_states_lock:
-        return {
-            k[-8:]: {  # show only last 8 chars for display
-                "exhausted": v["exhausted"],
-                "used": v["used"],
-            }
-            for k, v in _key_states.items()
-        }
+        result = {}
+        for k, v in _key_states.items():
+            if v["exhausted"]:
+                status = "exhausted"
+            elif v["rate_limited_until"] and _utc_now() < v["rate_limited_until"]:
+                status = "rate_limited"
+            else:
+                status = "active"
+            result[k[-8:]] = {"status": status, "used": v["used"]}
+        return result
 
 
 def all_keys_exhausted(keys):
-    return all(_is_exhausted(k) for k in keys)
+    """True only if ALL keys have hit the daily quota (not just rate-limited)."""
+    with _key_states_lock:
+        for key in keys:
+            state = _key_states.get(key)
+            if not state or not state["exhausted"]:
+                return False
+        return True
 
 
 def _get_next_key(keys):
@@ -145,21 +184,18 @@ def _scan_ip(ip, key, timeout):
                 "error": None,
                 "key_suffix": key[-8:],
             }
+        elif r.status_code == 429:
+            # Rate limited — put this key on cooldown, caller will retry with another key
+            _mark_rate_limited(key)
+            return None  # signal: retry with different key
         elif r.status_code == 403:
-            # Quota exceeded — mark this key as exhausted
             _mark_exhausted(key)
-            return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                    "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
-                    "error": "Key quota exceeded (403)", "key_suffix": key[-8:]}
+            return None  # signal: retry with different key
         elif r.status_code == 404:
             _increment_used(key)
             return {"ip": ip, "verdict": "not_found", "malicious": 0, "suspicious": 0,
                     "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
                     "error": "Not found in VT", "key_suffix": key[-8:]}
-        elif r.status_code == 429:
-            return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                    "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
-                    "error": "Rate limited (429)", "key_suffix": key[-8:]}
         else:
             return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
                     "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
@@ -192,28 +228,32 @@ def _run_scan(job_id):
     key_lock = threading.Lock()
     results = []
 
-    def pick_key():
-        # Try up to len(keys) times to find a non-exhausted key
+    def pick_key(exclude=None):
+        """Return next available key, skipping unavailable and optionally excluded ones."""
         with key_lock:
-            for _ in range(len(keys)):
+            for _ in range(len(keys) * 2):
                 k = next(key_cycle)
-                if not _is_exhausted(k):
+                if k != exclude and not _is_unavailable(k):
                     return k
-            return None  # all exhausted
+            return None
 
     def scan_one(ip):
-        key = pick_key()
-        if key is None:
-            return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                    "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
-                    "error": "All API keys exhausted for today", "key_suffix": "—"}
-        result = _scan_ip(ip, key, timeout)
-        # If this key just got exhausted, retry once with a different key
-        if result.get("error") == "Key quota exceeded (403)":
-            key2 = pick_key()
-            if key2 and key2 != key:
-                result = _scan_ip(ip, key2, timeout)
-        return result
+        tried = set()
+        while True:
+            key = pick_key()
+            if key is None or key in tried:
+                # All keys unavailable — wait briefly and try once more
+                time.sleep(5)
+                key = pick_key()
+            if key is None:
+                return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
+                        "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
+                        "error": "All keys rate-limited or exhausted", "key_suffix": "—"}
+            tried.add(key)
+            result = _scan_ip(ip, key, timeout)
+            if result is not None:
+                return result
+            # None means 429 or 403 — key is now marked, loop picks a fresh one
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(scan_one, ip): ip for ip in ips}

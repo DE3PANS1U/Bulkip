@@ -21,6 +21,9 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 _DEFAULT_KEYS = [k.strip() for k in os.getenv("VT_API_KEYS", "").split(",") if k.strip()]
 _MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
 
+# Pre-initialize key states so they show in UI before first scan
+scanner.init_key_states(_DEFAULT_KEYS)
+
 
 @app.route("/")
 def index():

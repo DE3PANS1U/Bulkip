@@ -202,8 +202,8 @@ td{padding:9px 14px;white-space:nowrap}
         <input type="file" id="file-input" accept=".txt,.csv,.xlsx"/>
       </div>
 
-      <label style="margin-top:16px">VirusTotal API Keys <span style="color:var(--muted);font-size:.72rem">(one per line — loaded from .env)</span></label>
-      <textarea id="api-keys" style="min-height:60px;font-size:.78rem" placeholder="Loaded from .env — paste here to override"></textarea>
+      <label style="margin-top:16px">VirusTotal API Keys <span style="color:var(--muted);font-size:.72rem">(up to 10 — one per line, overrides .env)</span></label>
+      <textarea id="api-keys" style="min-height:70px;font-size:.78rem" placeholder="Paste extra keys here (one per line) to add to .env keys&#10;Supports up to 10 keys total"></textarea>
 
       <label>Concurrent Workers</label>
       <div class="slider-row">
@@ -567,8 +567,12 @@ function updateKeyStatus(keyStatus) {
   if (!Object.keys(keyStatus).length) return;
   panel.style.display = 'block';
   rows.innerHTML = Object.entries(keyStatus).map(([suffix, s]) => {
-    const color = s.exhausted ? 'var(--red)' : 'var(--green)';
-    const label = s.exhausted ? '✗ Exhausted' : '✓ Active';
+    const statusMap = {
+      active:       { color: 'var(--green)',  label: '✓ Active' },
+      rate_limited: { color: 'var(--orange)', label: '⏸ Cooldown (60s)' },
+      exhausted:    { color: 'var(--red)',    label: '✗ Exhausted (daily)' },
+    };
+    const { color, label } = statusMap[s.status] || statusMap.active;
     return `<div style="display:flex;justify-content:space-between;align-items:center;
       padding:6px 0;border-bottom:1px solid var(--border);font-size:.78rem">
       <span style="font-family:monospace;color:var(--muted)">…${suffix}</span>
