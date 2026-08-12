@@ -571,6 +571,7 @@ function updateKeyStatus(keyStatus) {
       active:       { color: 'var(--green)',  label: '✓ Active' },
       rate_limited: { color: 'var(--orange)', label: '⏸ Cooldown (60s)' },
       exhausted:    { color: 'var(--red)',    label: '✗ Exhausted (daily)' },
+      invalid:      { color: 'var(--red)',    label: '✗ Invalid key (401)' },
     };
     const { color, label } = statusMap[s.status] || statusMap.active;
     return `<div style="display:flex;justify-content:space-between;align-items:center;

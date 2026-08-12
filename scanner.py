@@ -12,8 +12,8 @@ VT_URL = "https://www.virustotal.com/api/v3/ip_addresses/{}"
 _jobs = {}
 _jobs_lock = threading.Lock()
 
-# Per-key state: exhausted (daily quota), rate_limited (per-minute), used count
-# { key -> {"exhausted": bool, "exhausted_at": dt|None, "rate_limited_until": dt|None, "used": int} }
+# Per-key state: exhausted (daily quota), invalid (401), rate_limited (per-minute), used count
+# { key -> {"exhausted": bool, "invalid": bool, "exhausted_at": dt|None, "rate_limited_until": dt|None, "used": int} }
 _key_states = {}
 _key_states_lock = threading.Lock()
 
@@ -34,6 +34,7 @@ def init_key_states(keys):
             if key not in _key_states:
                 _key_states[key] = {
                     "exhausted": False,
+                    "invalid": False,
                     "exhausted_at": None,
                     "rate_limited_until": None,
                     "used": 0,
@@ -45,6 +46,12 @@ def _mark_exhausted(key):
         if key in _key_states:
             _key_states[key]["exhausted"] = True
             _key_states[key]["exhausted_at"] = _utc_now()
+
+
+def _mark_invalid(key):
+    with _key_states_lock:
+        if key in _key_states:
+            _key_states[key]["invalid"] = True
 
 
 def _mark_rate_limited(key):
@@ -64,11 +71,13 @@ def _increment_used(key):
 
 
 def _is_unavailable(key):
-    """Returns True if key is exhausted (daily) or rate-limited (cooldown not expired)."""
+    """Returns True if key is invalid, exhausted (daily), or rate-limited (cooldown not expired)."""
     with _key_states_lock:
         state = _key_states.get(key)
         if not state:
             return False
+        if state.get("invalid"):
+            return True
         # Daily quota exhausted — auto-reset at UTC midnight
         if state["exhausted"]:
             exhausted_date = state["exhausted_at"].date() if state["exhausted_at"] else None
@@ -90,7 +99,9 @@ def get_key_status():
     with _key_states_lock:
         result = {}
         for k, v in _key_states.items():
-            if v["exhausted"]:
+            if v.get("invalid"):
+                status = "invalid"
+            elif v["exhausted"]:
                 status = "exhausted"
             elif v["rate_limited_until"] and _utc_now() < v["rate_limited_until"]:
                 status = "rate_limited"
@@ -178,9 +189,9 @@ def _scan_ip(ip, key, timeout):
                 "suspicious": stats.get("suspicious", 0),
                 "harmless": stats.get("harmless", 0),
                 "undetected": stats.get("undetected", 0),
-                "country": attrs.get("country", "—"),
-                "owner": attrs.get("as_owner", "—"),
-                "asn": attrs.get("asn", "—"),
+                "country": attrs.get("country", "-"),
+                "owner": attrs.get("as_owner", "-"),
+                "asn": attrs.get("asn", "-"),
                 "error": None,
                 "key_suffix": key[-8:],
             }
@@ -191,22 +202,25 @@ def _scan_ip(ip, key, timeout):
         elif r.status_code == 403:
             _mark_exhausted(key)
             return None  # signal: retry with different key
+        elif r.status_code == 401:
+            _mark_invalid(key)
+            return None  # signal: retry with different key
         elif r.status_code == 404:
             _increment_used(key)
             return {"ip": ip, "verdict": "not_found", "malicious": 0, "suspicious": 0,
-                    "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
+                    "harmless": 0, "undetected": 0, "country": "-", "owner": "-", "asn": "-",
                     "error": "Not found in VT", "key_suffix": key[-8:]}
         else:
             return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                    "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
+                    "harmless": 0, "undetected": 0, "country": "-", "owner": "-", "asn": "-",
                     "error": f"HTTP {r.status_code}", "key_suffix": key[-8:]}
     except requests.exceptions.Timeout:
         return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
+                "harmless": 0, "undetected": 0, "country": "-", "owner": "-", "asn": "-",
                 "error": "Timeout", "key_suffix": key[-8:]}
     except Exception as e:
         return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
+                "harmless": 0, "undetected": 0, "country": "-", "owner": "-", "asn": "-",
                 "error": str(e), "key_suffix": key[-8:]}
 
 
@@ -238,22 +252,21 @@ def _run_scan(job_id):
             return None
 
     def scan_one(ip):
-        tried = set()
-        while True:
+        attempts = 0
+        max_attempts = max(len(keys) * 4, 8)
+        while attempts < max_attempts:
             key = pick_key()
-            if key is None or key in tried:
-                # All keys unavailable — wait briefly and try once more
-                time.sleep(5)
-                key = pick_key()
             if key is None:
-                return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
-                        "harmless": 0, "undetected": 0, "country": "—", "owner": "—", "asn": "—",
-                        "error": "All keys rate-limited or exhausted", "key_suffix": "—"}
-            tried.add(key)
+                time.sleep(5)
+                attempts += 1
+                continue
             result = _scan_ip(ip, key, timeout)
             if result is not None:
                 return result
-            # None means 429 or 403 — key is now marked, loop picks a fresh one
+            attempts += 1
+        return {"ip": ip, "verdict": "error", "malicious": 0, "suspicious": 0,
+                "harmless": 0, "undetected": 0, "country": "-", "owner": "-", "asn": "-",
+                "error": "All keys unavailable (invalid, rate-limited, or exhausted)", "key_suffix": "-"}
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(scan_one, ip): ip for ip in ips}
